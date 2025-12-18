@@ -9,10 +9,31 @@
 namespace {
 constexpr float kMaxPitch = 89.0f * DEG2RAD;
 constexpr float kMouseSensitivity = 0.0035f;
+constexpr float kEnemyAimSmoothing = 6.0f;
+constexpr float kOptimalEngageDistance = 10.0f;
+constexpr float kMaxEngageDistance = 26.0f;
+constexpr float kBulletDamage = 25.0f;
 
 Vector3 ForwardFromAngles(float yaw, float pitch) {
     float cosPitch = std::cos(pitch);
     return {std::cos(yaw) * cosPitch, std::sin(pitch), std::sin(yaw) * cosPitch};
+}
+
+float Approach(float current, float target, float delta) {
+    if (current < target) return std::min(target, current + delta);
+    return std::max(target, current - delta);
+}
+
+float NormalizeAngle(float angle) {
+    while (angle > PI) angle -= 2.0f * PI;
+    while (angle < -PI) angle += 2.0f * PI;
+    return angle;
+}
+
+float MoveTowardsAngle(float current, float target, float maxDelta) {
+    float delta = NormalizeAngle(target - current);
+    delta = std::clamp(delta, -maxDelta, maxDelta);
+    return NormalizeAngle(current + delta);
 }
 }
 
@@ -29,8 +50,10 @@ GameScene::GameScene(const GameConfig &config) : config(config) {
 void GameScene::update(float dt, const InputState &input) {
     timeAlive += dt;
     muzzleFlashTimer = std::max(0.0f, muzzleFlashTimer - dt);
+    enemyMuzzleFlashTimer = std::max(0.0f, enemyMuzzleFlashTimer - dt);
     respawnTimer = std::max(0.0f, respawnTimer - dt);
     player.fireTimer = std::max(0.0f, player.fireTimer - dt);
+    enemy.fireTimer = std::max(0.0f, enemy.fireTimer - dt);
 
     updatePlayer(dt, input);
     updateEnemy(dt);
@@ -54,6 +77,7 @@ void GameScene::render() {
 }
 
 void GameScene::updatePlayer(float dt, const InputState &input) {
+    Vector3 prevPos = player.position;
     player.yaw += input.lookDelta.x * kMouseSensitivity;
     player.pitch = std::clamp(player.pitch - input.lookDelta.y * kMouseSensitivity, -kMaxPitch, kMaxPitch);
 
@@ -80,11 +104,16 @@ void GameScene::updatePlayer(float dt, const InputState &input) {
     player.camera.position = player.position;
     player.camera.target = Vector3Add(player.position, forward);
 
+    if (dt > 0.0f) {
+        player.velocity = Vector3Scale(Vector3Subtract(player.position, prevPos), 1.0f / dt);
+    }
+
     if (input.fire && player.fireTimer <= 0.0f) {
         Bullet bullet{};
         bullet.position = Vector3Add(player.position, {0.0f, -0.1f, 0.0f});
         bullet.velocity = Vector3Scale(forward, 65.0f);
         bullet.lifetime = 2.5f;
+        bullet.fromPlayer = true;
         bullets.push_back(bullet);
 
         muzzleFlashTimer = 0.08f;
@@ -99,11 +128,12 @@ void GameScene::updateBullets(float dt) {
 
         bool expired = bullet.lifetime <= 0.0f;
         bool hit = false;
-        if (enemy.health > 0) {
+
+        if (bullet.fromPlayer && enemy.health > 0) {
             float distSq = Vector3DistanceSqr(bullet.position, enemy.position);
             float radius = enemy.radius + 0.2f;
             if (distSq <= radius * radius) {
-                enemy.health -= 25;
+                enemy.health -= static_cast<int>(kBulletDamage);
                 hit = true;
                 score += 25;
                 if (enemy.health <= 0) {
@@ -111,11 +141,16 @@ void GameScene::updateBullets(float dt) {
                     score += 75;
                 }
             }
+        } else if (!bullet.fromPlayer && player.health > 0) {
+            float distSq = Vector3DistanceSqr(bullet.position, player.position);
+            float radius = 0.7f;
+            if (distSq <= radius * radius) {
+                player.health = std::max(0, player.health - static_cast<int>(kBulletDamage));
+                hit = true;
+            }
         }
 
-        if (expired || hit) {
-            bullet.lifetime = -1.0f;
-        }
+        if (expired || hit) bullet.lifetime = -1.0f;
     }
 
     bullets.erase(std::remove_if(bullets.begin(), bullets.end(), [](const Bullet &b) { return b.lifetime <= 0.0f; }), bullets.end());
@@ -124,18 +159,71 @@ void GameScene::updateBullets(float dt) {
 void GameScene::updateEnemy(float dt) {
     if (enemy.health <= 0) return;
 
-    enemy.patrolT += dt * enemy.patrolSpeed;
-    float pathRadius = 6.0f;
-    enemy.position.x = std::cos(enemy.patrolT) * pathRadius;
-    enemy.position.z = std::sin(enemy.patrolT) * pathRadius + 6.0f;
+    // Strategic movement: maintain distance, strafe unpredictably, and reposition when too close/far.
+    enemy.strafeTimer -= dt;
+    if (enemy.strafeTimer <= 0.0f) {
+        enemy.strafeDir = (std::sin(timeAlive * 1.7f) > 0.0f) ? 1.0f : -1.0f;
+        enemy.strafeTimer = 1.0f + std::fmod(timeAlive, 0.8f);
+    }
 
-    // Enemy slowly strafes up/down for motion.
-    enemy.position.y = 1.8f + std::sin(timeAlive * 1.5f) * 0.35f;
+    Vector3 prevPos = enemy.position;
+    Vector3 toPlayer = Vector3Subtract(player.position, enemy.position);
+    float distToPlayer = Vector3Length(toPlayer);
+    Vector3 dirToPlayer = (distToPlayer > 0.001f) ? Vector3Scale(toPlayer, 1.0f / distToPlayer) : Vector3{0.0f, 0.0f, 1.0f};
 
-    // Contact damage (simple proximity check).
-    float distToPlayer = Vector3Distance(enemy.position, player.position);
-    if (distToPlayer < enemy.radius + 0.8f) {
-        player.health = std::max(0, player.health - static_cast<int>(35 * dt));
+    // Desired movement blends closing/opening distance with lateral strafing to avoid being a static target.
+    Vector3 flatDir = {dirToPlayer.x, 0.0f, dirToPlayer.z};
+    if (Vector3Length(flatDir) > 0.001f) flatDir = Vector3Normalize(flatDir);
+    Vector3 forward = ForwardFromAngles(enemy.yaw, enemy.pitch);
+    Vector3 flatForward = {forward.x, 0.0f, forward.z};
+    if (Vector3Length(flatForward) > 0.001f) flatForward = Vector3Normalize(flatForward);
+    Vector3 right = Vector3CrossProduct(flatForward, {0.0f, 1.0f, 0.0f});
+    if (Vector3Length(right) > 0.001f) right = Vector3Normalize(right);
+
+    Vector3 move = {0.0f, 0.0f, 0.0f};
+    if (distToPlayer > kOptimalEngageDistance + 1.5f && distToPlayer < kMaxEngageDistance + 4.0f) {
+        move = Vector3Add(move, flatDir); // close distance
+    } else if (distToPlayer < kOptimalEngageDistance - 1.0f) {
+        move = Vector3Subtract(move, flatDir); // backpedal to keep space
+    }
+    move = Vector3Add(move, Vector3Scale(right, enemy.strafeDir * 0.8f));
+
+    if (Vector3Length(move) > 0.001f) {
+        move = Vector3Normalize(move);
+        enemy.position = Vector3Add(enemy.position, Vector3Scale(move, enemy.speed * dt));
+    }
+
+    enemy.position.y = enemy.height;
+    if (dt > 0.0f) enemy.velocity = Vector3Scale(Vector3Subtract(enemy.position, prevPos), 1.0f / dt);
+
+    // Predictive aiming to account for player velocity.
+    Vector3 predictedPlayerPos = Vector3Add(player.position, Vector3Scale(player.velocity, 0.25f));
+    Vector3 aimVector = Vector3Subtract(predictedPlayerPos, enemy.position);
+    float aimLength = Vector3Length(aimVector);
+    Vector3 aimDir = (aimLength > 0.001f) ? Vector3Scale(aimVector, 1.0f / aimLength) : Vector3{0.0f, 0.0f, 1.0f};
+    float desiredYaw = std::atan2(aimDir.z, aimDir.x);
+    float desiredPitch = std::asin(std::clamp(aimDir.y, -1.0f, 1.0f));
+
+    enemy.yaw = MoveTowardsAngle(enemy.yaw, desiredYaw, kEnemyAimSmoothing * dt);
+    enemy.pitch = std::clamp(Approach(enemy.pitch, desiredPitch, kEnemyAimSmoothing * dt), -kMaxPitch, kMaxPitch);
+
+    // Fire only when within range and roughly on target.
+    forward = ForwardFromAngles(enemy.yaw, enemy.pitch);
+    float forwardLen = Vector3Length(forward);
+    if (forwardLen > 0.001f) forward = Vector3Scale(forward, 1.0f / forwardLen);
+    float alignment = Vector3DotProduct(forward, aimDir);
+    bool inRange = distToPlayer < kMaxEngageDistance;
+    bool hasAim = alignment > std::cos(10.0f * DEG2RAD);
+    if (inRange && hasAim && enemy.fireTimer <= 0.0f && player.health > 0) {
+        Bullet bullet{};
+        bullet.fromPlayer = false;
+        bullet.position = Vector3Add(enemy.position, {0.0f, -0.1f, 0.0f});
+        bullet.velocity = Vector3Scale(forward, 65.0f);
+        bullet.lifetime = 2.5f;
+        bullets.push_back(bullet);
+
+        enemyMuzzleFlashTimer = 0.08f;
+        enemy.fireTimer = enemy.fireCooldown;
     }
 }
 
@@ -160,6 +248,12 @@ void GameScene::drawWorld() const {
         Vector3 forward = ForwardFromAngles(player.yaw, player.pitch);
         Vector3 flashPos = Vector3Add(player.position, Vector3Scale(forward, 0.6f));
         DrawSphere(flashPos, 0.15f, Color{255, 230, 180, 230});
+    }
+
+    if (enemyMuzzleFlashTimer > 0.0f && enemy.health > 0) {
+        Vector3 forward = ForwardFromAngles(enemy.yaw, enemy.pitch);
+        Vector3 flashPos = Vector3Add(enemy.position, Vector3Scale(forward, 0.6f));
+        DrawSphere(flashPos, 0.12f, Color{255, 170, 140, 200});
     }
 }
 
@@ -198,4 +292,9 @@ void GameScene::resetEnemy() {
     enemy.position = {6.0f, 1.8f, 6.0f};
     enemy.patrolT = 0.0f;
     enemy.patrolSpeed = 0.8f + static_cast<float>(score) * 0.002f;
+    enemy.fireTimer = 0.4f;
+    enemy.yaw = std::atan2(player.position.z - enemy.position.z, player.position.x - enemy.position.x);
+    enemy.pitch = 0.0f;
+    enemy.strafeTimer = 0.0f;
+    enemy.velocity = {0.0f, 0.0f, 0.0f};
 }
