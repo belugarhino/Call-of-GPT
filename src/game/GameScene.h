@@ -12,10 +12,12 @@ struct Bullet {
     Vector3 position{};
     Vector3 velocity{};
     float lifetime = 2.0f;
+    bool fromPlayer = true;
 };
 
 struct Player {
     Vector3 position{0.0f, 1.8f, 0.0f};
+    Vector3 velocity{};
     float yaw = 0.0f;
     float pitch = 0.0f;
     float speed = 6.0f;
@@ -28,10 +30,19 @@ struct Player {
 
 struct Enemy {
     Vector3 position{0.0f, 1.8f, 8.0f};
+    Vector3 velocity{};
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float speed = 6.0f;
+    float height = 1.8f;
+    float fireCooldown = 0.12f;
+    float fireTimer = 0.0f;
     float radius = 0.8f;
     int health = 100;
     float patrolT = 0.0f;
     float patrolSpeed = 1.0f;
+    float strafeDir = 1.0f;
+    float strafeTimer = 0.0f;
 };
 
 class GameScene : public Scene {
@@ -58,4 +69,5 @@ class GameScene : public Scene {
     float respawnTimer = 0.0f;
     float timeAlive = 0.0f;
     float muzzleFlashTimer = 0.0f;
+    float enemyMuzzleFlashTimer = 0.0f;
 };
